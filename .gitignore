@@ -1,0 +1,20 @@
+# Credentials & Secrets
+.env
+*.session*
+*.session-journal
+*.session-shm
+*.session-wal
+
+# Logs & Dynamic State
+*.log
+last_digest_date.txt
+
+# Internal Migration / Archive Tools & Data Dumps
+_archive/
+
+# Python Cache
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/

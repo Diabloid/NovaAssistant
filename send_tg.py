@@ -1,4 +1,5 @@
-import sys, os, argparse, json, urllib.request
+import sys, os, argparse, json, urllib.request, time, socket, ssl
+from http.client import RemoteDisconnected
 
 if sys.stdout is not None:
     try:
@@ -31,11 +32,25 @@ parser.add_argument('--as-bot', action='store_true', help='Force send as bot')
 parser.add_argument('--as-user', action='store_true', help='Force send as userbot')
 parser.add_argument('--pin', action='store_true', help='Pin message after sending')
 
-def _do_bot_request(endpoint, payload):
+def _do_bot_request(endpoint, payload, max_retries=4):
     url = f'https://api.telegram.org/bot{BOT_TOKEN}/{endpoint}'
     data = json.dumps(payload).encode('utf-8')
-    req = urllib.request.Request(url, data=data, headers={'Content-Type': 'application/json'})
-    return urllib.request.urlopen(req)
+    
+    last_err = None
+    for attempt in range(1, max_retries + 1):
+        try:
+            req = urllib.request.Request(url, data=data, headers={'Content-Type': 'application/json'})
+            return urllib.request.urlopen(req, timeout=20)
+        except urllib.error.HTTPError:
+            # Application-level Telegram HTTP errors (like 400 Bad Request) are re-raised to allow fallback logic
+            raise
+        except (ConnectionResetError, urllib.error.URLError, ssl.SSLError, RemoteDisconnected, socket.timeout, TimeoutError, OSError) as e:
+            last_err = e
+            if attempt < max_retries:
+                time.sleep(1.2 * attempt)
+            else:
+                break
+    raise last_err
 
 def send_via_bot(chat_id, text, topic=None, pin=False):
     cid = chat_id
@@ -102,12 +117,21 @@ def send_file_via_bot(chat_id, file_path, caption='', topic=None):
     if topic and topic != 1:
         data['message_thread_id'] = topic
         
-    with open(file_path, 'rb') as f:
-        res = requests.post(url, data=data, files={'document': f})
-    if res.ok:
-        print(f"SUCCESS: Sent file via Bot to {chat_id} (topic: {topic})")
-    else:
-        print(f"ERROR: Failed to send file: {res.text}")
+    for attempt in range(1, 4):
+        try:
+            with open(file_path, 'rb') as f:
+                res = requests.post(url, data=data, files={'document': f}, timeout=30)
+            if res.ok:
+                print(f"SUCCESS: Sent file via Bot to {chat_id} (topic: {topic})")
+                return
+            else:
+                print(f"ERROR: Failed to send file: {res.text}")
+                return
+        except Exception as e:
+            if attempt < 3:
+                time.sleep(1.5 * attempt)
+            else:
+                print(f"ERROR: Failed to send file due to network error: {e}")
 
 def send_via_userbot(target, text, topic=None, pin=False, file_path=None):
     from telethon.sync import TelegramClient

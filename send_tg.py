@@ -32,24 +32,47 @@ parser.add_argument('--as-bot', action='store_true', help='Force send as bot')
 parser.add_argument('--as-user', action='store_true', help='Force send as userbot')
 parser.add_argument('--pin', action='store_true', help='Pin message after sending')
 
-def _do_bot_request(endpoint, payload, max_retries=4):
+def _do_bot_request(endpoint, payload, max_retries=2):
+    import requests
     url = f'https://api.telegram.org/bot{BOT_TOKEN}/{endpoint}'
-    data = json.dumps(payload).encode('utf-8')
-    
+
     last_err = None
     for attempt in range(1, max_retries + 1):
         try:
-            req = urllib.request.Request(url, data=data, headers={'Content-Type': 'application/json'})
-            return urllib.request.urlopen(req, timeout=20)
-        except urllib.error.HTTPError:
-            # Application-level Telegram HTTP errors (like 400 Bad Request) are re-raised to allow fallback logic
-            raise
-        except (ConnectionResetError, urllib.error.URLError, ssl.SSLError, RemoteDisconnected, socket.timeout, TimeoutError, OSError) as e:
+            # timeout=(connect_timeout, read_timeout): 5s to connect, 15s to wait for Telegram response
+            res = requests.post(url, json=payload, timeout=(5, 15))
+            if res.status_code == 429:
+                last_err = urllib.error.HTTPError(url, res.status_code, res.reason, res.headers, None)
+                retry_after = 1.5
+                try:
+                    retry_header = res.headers.get('Retry-After')
+                    if retry_header:
+                        retry_after = max(1, int(retry_header))
+                except Exception:
+                    pass
+                if attempt < max_retries:
+                    time.sleep(retry_after * attempt)
+                    continue
+                raise last_err
+
+            if not res.ok:
+                # Raise HTTPError with response body preserved in fp for 400 Markdown fallback
+                import io
+                raise urllib.error.HTTPError(
+                    url, res.status_code, res.reason, res.headers, io.BytesIO(res.content)
+                )
+
+            return res.json()
+        except requests.exceptions.ConnectTimeout as e:
+            # Failed before reaching Telegram server: safe to retry
             last_err = e
             if attempt < max_retries:
-                time.sleep(1.2 * attempt)
+                time.sleep(1.0 * attempt)
             else:
-                break
+                raise
+        except requests.exceptions.RequestException as e:
+            # ReadTimeout, ConnectionError after send, etc. — do NOT blindly retry sendMessage to avoid duplicates
+            raise e
     raise last_err
 
 def send_via_bot(chat_id, text, topic=None, pin=False):
@@ -73,16 +96,14 @@ def send_via_bot(chat_id, text, topic=None, pin=False):
             payload['message_thread_id'] = topic
 
         try:
-            res = _do_bot_request('sendMessage', payload)
-            res_data = json.loads(res.read().decode('utf-8'))
+            res_data = _do_bot_request('sendMessage', payload)
         except urllib.error.HTTPError as e:
             err_body = e.read().decode('utf-8', errors='ignore')
             # If markdown entity parsing failed, fallback to plain text without parse_mode
             if 'parse entities' in err_body.lower() or 'bad request' in err_body.lower():
                 payload.pop('parse_mode', None)
                 try:
-                    res = _do_bot_request('sendMessage', payload)
-                    res_data = json.loads(res.read().decode('utf-8'))
+                    res_data = _do_bot_request('sendMessage', payload)
                 except urllib.error.HTTPError as e2:
                     err_body2 = e2.read().decode('utf-8', errors='ignore')
                     print(f"ERROR: Telegram Bot API failed: {err_body2}", file=sys.stderr)
@@ -183,13 +204,21 @@ if __name__ == '__main__':
         if args.as_user:
             send_via_userbot(args.to, args.text, args.topic, args.pin, file_path=args.file)
         elif args.as_bot or is_group_or_storage:
-            send_file_via_bot(args.to, args.file, args.text, args.topic)
+            try:
+                send_file_via_bot(args.to, args.file, args.text, args.topic)
+            except Exception as e:
+                print(f"WARNING: Bot API file send failed ({e}). Falling back to Userbot...", file=sys.stderr)
+                send_via_userbot(args.to, args.text, args.topic, args.pin, file_path=args.file)
         else:
             send_via_userbot(args.to, args.text, args.topic, args.pin, file_path=args.file)
     else:
         if args.as_user:
             send_via_userbot(args.to, args.text, args.topic, args.pin)
         elif args.as_bot or is_group_or_storage:
-            send_via_bot(args.to, args.text, args.topic, args.pin)
+            try:
+                send_via_bot(args.to, args.text, args.topic, args.pin)
+            except Exception as e:
+                print(f"WARNING: Bot API failed ({e}). Falling back to Userbot...", file=sys.stderr)
+                send_via_userbot(args.to, args.text, args.topic, args.pin)
         else:
             send_via_userbot(args.to, args.text, args.topic, args.pin)
